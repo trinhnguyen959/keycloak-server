@@ -315,7 +315,7 @@ EOF
 #########################
 keycloak_initialize() {
     # Clean to avoid issues when running docker restart
-    keycloak_clean_from_restart
+    # keycloak_clean_from_restart
 
     # Wait for database
     info "Trying to connect to Oracle server $KEYCLOAK_DATABASE_HOST..."
