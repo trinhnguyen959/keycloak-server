@@ -123,12 +123,74 @@ keycloak_conf_set() {
 #   None
 #########################
 keycloak_configure_database() {
+    # Prepare JDBC Params if set - add '?' at the beginning if the value is not empty and doesn't start with '?'
+    local jdbc_params
+    jdbc_params="$(echo "$KEYCLOAK_JDBC_PARAMS" | sed -E '/^$|^\?+.*$/!s/^/?/')"
+
     info "Configuring database settings"
-    keycloak_conf_set "db" "postgres"
-    keycloak_conf_set "db-username" "$KEYCLOAK_DATABASE_USER"
-    keycloak_conf_set "db-password" "$KEYCLOAK_DATABASE_PASSWORD"
-    keycloak_conf_set "db-url" "jdbc:postgresql://${KEYCLOAK_DATABASE_HOST}:${KEYCLOAK_DATABASE_PORT}/${KEYCLOAK_DATABASE_NAME}?currentSchema=${KEYCLOAK_DATABASE_SCHEMA}"
-    debug_execute kc.sh build --db postgres
+    debug_execute jboss-cli.sh <<EOF
+embed-server --server-config=${KEYCLOAK_CONF_FILE} --std-out=echo
+batch
+/subsystem=datasources/data-source=KeycloakDS: remove()
+/subsystem=datasources/data-source=KeycloakDS: add(jndi-name=java:jboss/datasources/KeycloakDS,enabled=true,use-java-context=true,use-ccm=true, connection-url="jdbc:oracle:thin:@//${KEYCLOAK_DATABASE_HOST}:${KEYCLOAK_DATABASE_PORT}/${KEYCLOAK_DATABASE_NAME}${jdbc_params}", driver-name=oracle)
+/subsystem=datasources/data-source=KeycloakDS: write-attribute(name=user-name, value=\${env.KEYCLOAK_DATABASE_USER})
+/subsystem=datasources/data-source=KeycloakDS: write-attribute(name=check-valid-connection-sql, value="SELECT 1 FROM DUAL")
+/subsystem=datasources/data-source=KeycloakDS: write-attribute(name=background-validation, value=true)
+/subsystem=datasources/data-source=KeycloakDS: write-attribute(name=background-validation-millis, value=60000)
+/subsystem=datasources/data-source=KeycloakDS: write-attribute(name=flush-strategy, value=IdleConnections)
+/subsystem=datasources/jdbc-driver=oracle:add(driver-name=oracle, driver-module-name=com.oracle, driver-xa-datasource-class-name=oracle.jdbc.xa.client.OracleXADataSource)
+/subsystem=keycloak-server/spi=connectionsJpa/provider=default:write-attribute(name=properties.schema,value=${KEYCLOAK_DATABASE_SCHEMA})
+run-batch
+stop-embedded-server
+EOF
+
+    if ! is_empty_value "$KEYCLOAK_DATABASE_PASSWORD"; then
+        debug_execute jboss-cli.sh <<EOF
+embed-server --server-config=${KEYCLOAK_CONF_FILE} --std-out=echo
+batch
+/subsystem=datasources/data-source=KeycloakDS: write-attribute(name=password, value=\${env.KEYCLOAK_DATABASE_PASSWORD})
+run-batch
+stop-embedded-server
+EOF
+    fi
+}
+
+########################
+# Configure JGroups settings using JBoss CLI
+# Globals:
+#   KEYCLOAK_*
+# Arguments:
+#   None
+# Returns:
+#   None
+#########################
+keycloak_configure_jgroups() {
+    info "Configuring jgroups settings"
+    if [[ "$KEYCLOAK_JGROUPS_DISCOVERY_PROTOCOL" == "JDBC_PING" ]]; then
+        debug_execute jboss-cli.sh <<EOF
+embed-server --server-config=${KEYCLOAK_CONF_FILE} --std-out=echo
+batch
+/subsystem=jgroups/stack=udp/protocol=PING:remove()
+/subsystem=jgroups/stack=udp/protocol=JDBC_PING:add(add-index=0, data-source=KeycloakDS, properties={${KEYCLOAK_JGROUPS_DISCOVERY_PROPERTIES}})
+/subsystem=jgroups/stack=tcp/protocol=MPING:remove()
+/subsystem=jgroups/stack=tcp/protocol=JDBC_PING:add(add-index=0, data-source=KeycloakDS, properties={${KEYCLOAK_JGROUPS_DISCOVERY_PROPERTIES}})
+/subsystem=jgroups/channel=ee:write-attribute(name="stack", value=${KEYCLOAK_JGROUPS_TRANSPORT_STACK})
+run-batch
+stop-embedded-server
+EOF
+    else
+        debug_execute jboss-cli.sh <<EOF
+embed-server --server-config=${KEYCLOAK_CONF_FILE} --std-out=echo
+batch
+/subsystem=jgroups/stack=udp/protocol=PING:remove()
+/subsystem=jgroups/stack=udp/protocol=${KEYCLOAK_JGROUPS_DISCOVERY_PROTOCOL}:add(add-index=0, properties={${KEYCLOAK_JGROUPS_DISCOVERY_PROPERTIES}})
+/subsystem=jgroups/stack=tcp/protocol=MPING:remove()
+/subsystem=jgroups/stack=tcp/protocol=${KEYCLOAK_JGROUPS_DISCOVERY_PROTOCOL}:add(add-index=0, properties={${KEYCLOAK_JGROUPS_DISCOVERY_PROPERTIES}})
+/subsystem=jgroups/channel=ee:write-attribute(name="stack", value=${KEYCLOAK_JGROUPS_TRANSPORT_STACK})
+run-batch
+stop-embedded-server
+EOF
+    fi
 }
 
 ########################
@@ -223,19 +285,23 @@ keycloak_configure_proxy() {
 }
 
 ########################
-# Configure database settings
+# Configure node identifier
 # Globals:
 #   KEYCLOAK_*
 # Arguments:
+#   None
 # Returns:
 #   None
 #########################
-keycloak_configure_tls() {
-    info "Configuring TLS by setting keystore and truststore"
-    keycloak_conf_set "https-key-store-file" "${KEYCLOAK_TLS_KEYSTORE_FILE}"
-    keycloak_conf_set "https-trust-store-file" "${KEYCLOAK_TLS_TRUSTSTORE_FILE}"
-    ! is_empty_value "$KEYCLOAK_TLS_KEYSTORE_PASSWORD" && keycloak_conf_set "https-key-store-password" "${KEYCLOAK_TLS_KEYSTORE_PASSWORD}"
-    ! is_empty_value "$KEYCLOAK_TLS_TRUSTSTORE_PASSWORD" && keycloak_conf_set "https-trust-store-password" "${KEYCLOAK_TLS_TRUSTSTORE_PASSWORD}"
+keycloak_configure_node_identifier() {
+    info "Configuring node identifier"
+    debug_execute jboss-cli.sh <<EOF
+embed-server --server-config=${KEYCLOAK_CONF_FILE} --std-out=echo
+batch
+/subsystem=transactions:write-attribute(name=node-identifier, value=\${jboss.node.name})
+run-batch
+stop-embedded-server
+EOF
 }
 
 ########################
@@ -249,13 +315,15 @@ keycloak_configure_tls() {
 #########################
 keycloak_initialize() {
     # Clean to avoid issues when running docker restart
+    keycloak_clean_from_restart
+
     # Wait for database
-    info "Trying to connect to PostgreSQL server $KEYCLOAK_DATABASE_HOST..."
+    info "Trying to connect to Oracle server $KEYCLOAK_DATABASE_HOST..."
     if ! retry_while "wait-for-port --host $KEYCLOAK_DATABASE_HOST --timeout 10 $KEYCLOAK_DATABASE_PORT" "$KEYCLOAK_INIT_MAX_RETRIES"; then
         error "Unable to connect to host $KEYCLOAK_DATABASE_HOST"
         exit 1
     else
-        info "Found PostgreSQL server listening at $KEYCLOAK_DATABASE_HOST:$KEYCLOAK_DATABASE_PORT"
+        info "Found Oracle server listening at $KEYCLOAK_DATABASE_HOST:$KEYCLOAK_DATABASE_PORT"
     fi
 
     if ! is_dir_empty "$KEYCLOAK_MOUNTED_CONF_DIR"; then

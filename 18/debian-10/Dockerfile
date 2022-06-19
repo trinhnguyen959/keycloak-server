@@ -27,6 +27,9 @@ ENV APP_VERSION="18.0.0" \
     JAVA_HOME="/opt/bitnami/java" \
     PATH="/opt/bitnami/common/bin:/opt/bitnami/java/bin:/opt/bitnami/keycloak/bin:$PATH"
 
+# Copy oracle driver
+COPY driver/ /opt/bitnami/keycloak/modules/system/layers/keycloak/
+
 USER 1001
 ENTRYPOINT [ "/opt/bitnami/scripts/keycloak/entrypoint.sh" ]
 CMD [ "/opt/bitnami/scripts/keycloak/run.sh" ]
